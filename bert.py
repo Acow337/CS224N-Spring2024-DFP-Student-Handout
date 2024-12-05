@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +10,8 @@ from utils import *
 class BertSelfAttention(nn.Module):
   def __init__(self, config):
     super().__init__()
+
+    # attention_head_size 每个head有多少size
 
     self.num_attention_heads = config.num_attention_heads
     self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
@@ -43,14 +47,33 @@ class BertSelfAttention(nn.Module):
     # Note that the attention mask distinguishes between non-padding tokens (with a value of 0)
     # and padding tokens (with a value of a large negative number).
 
+    # Size of (key, query and value) is [bs, num_attention_heads, seq_len, attention_head_size].
+
     # Make sure to:
     # - Normalize the scores with softmax.
     # - Multiply the attention scores with the value to get back weighted values.
     # - Before returning, concatenate multi-heads to recover the original shape:
     #   [bs, seq_len, num_attention_heads * attention_head_size = hidden_size].
 
-    ### TODO
-    raise NotImplementedError
+    # 把 k q v [bs, num_attention_heads, seq_len, attention_head_size] 转换成 [bs * num_attention_heads, seq_len, attention_head_size]
+    # 把 attention_mask [bs, 1, 1, seq_len] 转换成 [bs* num_attention_heads, 1, seq_len]
+    # 再把 attention_mask [bs * num_attention_heads , 1, seq_len] 转成 [bs * num_attention_heads , seq_len, seq_len]
+    # 然后作为单头注意力的输入，这样等同于多头注意力处理（方便为了并行处理）
+    # keys, querys, values 这样可以作为单头注意力的输入
+    batch_size, num_attention_heads, seq_len, attention_head_size = key.shape[0], key.shape[1], key.shape[2], key.shape[3]
+    keys = key.permute(0, 2, 1, 3).reshape(-1, seq_len, attention_head_size)
+    querys = query.permute(0, 2, 1, 3).reshape(-1, seq_len, attention_head_size)
+    values = value.permute(0, 2, 1, 3).reshape(-1, seq_len, attention_head_size)
+    attention_mask = attention_mask.repeat(1, num_attention_heads, 1, 1)
+    attention_mask = attention_mask.view(batch_size * num_attention_heads, 1, seq_len)
+    attention_mask = attention_mask.expand(-1, seq_len, seq_len)
+
+    attention = self.dot_product_attention(keys, querys, values, attention_mask)
+    # attention [bs * num_attention_heads, seq_len, attention_head_size]　　　
+    # Before returning, concatenate multi-heads to recover the original shape: [bs, seq_len, num_attention_heads * attention_head_size = hidden_size]
+    attention = attention.reshape(batch_size , num_attention_heads , seq_len, attention_head_size).permute(0, 2, 1, 3)
+
+    return attention
 
 
   def forward(self, hidden_states, attention_mask):
@@ -68,6 +91,18 @@ class BertSelfAttention(nn.Module):
     # Calculate the multi-head attention.
     attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
     return attn_value
+
+  # 点积注意力
+  # attention_mask: [bs * num_attention_heads , 1, seq_len]
+  # k q v size: [bs * num_attention_heads, seq_len, attention_head_size]
+  def dot_product_attention(self, key, query, value, attention_mask):
+    d = query.shape[-1]
+    # 设置transpose_b=True为了交换keys的最后两个维度
+    # scores size：[bs * num_attention_heads, seq_len, seq_len]
+    scores = torch.bmm(query, key.transpose(1, 2)) / math.sqrt(d)
+
+    scores = scores.masked_fill(attention_mask == 0, float('-inf'))
+    return torch.bmm(self.dropout(scores), value)
 
 
 class BertLayer(nn.Module):
@@ -93,7 +128,7 @@ class BertLayer(nn.Module):
     input: the input of the previous layer
     output: the output of the previous layer
     dense_layer: used to transform the output
-    dropout: the dropout to be applied 
+    dropout: the dropout to be applied
     ln_layer: the layer norm to be applied
     """
     # Hint: Remember that BERT applies dropout to the transformed output of each sub-layer,
@@ -120,7 +155,7 @@ class BertLayer(nn.Module):
 class BertModel(BertPreTrainedModel):
   """
   The BERT model returns the final embeddings for each token in a sentence.
-  
+
   The model consists of:
   1. Embedding layers (used in self.embed).
   2. A stack of n BERT layers (used in self.encode).
